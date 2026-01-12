@@ -622,7 +622,7 @@ class CISBenchmark:
         self.check_5_access_authentication()
         self.check_6_system_maintenance()
     
-    def generate_report(self, output_file=None):
+    def generate_report(self, output_file=None, show_passed=True):
         """Generate compliance report"""
         total = len(self.results)
         
@@ -667,12 +667,79 @@ class CISBenchmark:
         print("="*70 + "\n")
         
         return report
+    
+    def print_detailed_results(self, show_passed=True, show_failed=True, show_manual=True):
+        """Print detailed results organized by status"""
+        
+        # Color codes for terminal output
+        GREEN = '\033[92m'
+        RED = '\033[91m'
+        YELLOW = '\033[93m'
+        BLUE = '\033[94m'
+        RESET = '\033[0m'
+        BOLD = '\033[1m'
+        
+        # Group results by status
+        passed_results = [r for r in self.results if r['status'] == 'PASS']
+        failed_results = [r for r in self.results if r['status'] == 'FAIL']
+        manual_results = [r for r in self.results if r['status'] == 'MANUAL']
+        
+        # Print PASSED checks
+        if show_passed and passed_results:
+            print(f"\n{GREEN}{BOLD}{'='*70}")
+            print(f"✓ PASSED CHECKS ({len(passed_results)})")
+            print(f"{'='*70}{RESET}\n")
+            
+            for result in passed_results:
+                print(f"{GREEN}[✓ PASS]{RESET} {BOLD}[{result['section']}]{RESET} {result['title']}")
+                print(f"  {GREEN}└─{RESET} {result['details']}")
+                print()
+        
+        # Print FAILED checks
+        if show_failed and failed_results:
+            print(f"\n{RED}{BOLD}{'='*70}")
+            print(f"✗ FAILED CHECKS ({len(failed_results)})")
+            print(f"{'='*70}{RESET}\n")
+            
+            for result in failed_results:
+                print(f"{RED}[✗ FAIL]{RESET} {BOLD}[{result['section']}]{RESET} {result['title']}")
+                print(f"  {RED}├─{RESET} Issue: {result['details']}")
+                if result['recommendation']:
+                    print(f"  {RED}└─{RESET} {BOLD}Remediation:{RESET} {result['recommendation']}")
+                print()
+        
+        # Print MANUAL checks
+        if show_manual and manual_results:
+            print(f"\n{YELLOW}{BOLD}{'='*70}")
+            print(f"⚠ MANUAL REVIEW REQUIRED ({len(manual_results)})")
+            print(f"{'='*70}{RESET}\n")
+            
+            for result in manual_results:
+                print(f"{YELLOW}[⚠ MANUAL]{RESET} {BOLD}[{result['section']}]{RESET} {result['title']}")
+                print(f"  {YELLOW}├─{RESET} Details: {result['details']}")
+                if result['recommendation']:
+                    print(f"  {YELLOW}└─{RESET} Action: {result['recommendation']}")
+                print()
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='CIS Benchmark Compliance Scanner for Red Hat Enterprise Linux',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Run full scan with all details
+  sudo python3 cis_redhat_benchmark.py --show-all
+  
+  # Save detailed report to file
+  sudo python3 cis_redhat_benchmark.py -o compliance_report.json --show-all
+  
+  # Show only failed checks
+  sudo python3 cis_redhat_benchmark.py --failed-only
+  
+  # Show passed and failed, but not manual
+  sudo python3 cis_redhat_benchmark.py --show-passed --show-failed
+        '''
     )
     
     parser.add_argument('-o', '--output', help='Output file for report')
@@ -680,6 +747,16 @@ def main():
                        help='Output format (default: json)')
     parser.add_argument('--failed-only', action='store_true',
                        help='Show only failed checks')
+    parser.add_argument('--show-all', action='store_true',
+                       help='Show all checks (passed, failed, and manual)')
+    parser.add_argument('--show-passed', action='store_true',
+                       help='Show passed checks')
+    parser.add_argument('--show-failed', action='store_true',
+                       help='Show failed checks')
+    parser.add_argument('--show-manual', action='store_true',
+                       help='Show checks requiring manual review')
+    parser.add_argument('--no-color', action='store_true',
+                       help='Disable colored output')
     
     args = parser.parse_args()
     
@@ -692,17 +769,37 @@ def main():
     scanner.run_all_checks()
     report = scanner.generate_report(args.output)
     
-    # Print failed checks
-    if args.failed_only or scanner.failed > 0:
-        print("\nFAILED CHECKS:")
-        print("-" * 70)
-        for result in scanner.results:
-            if result['status'] == 'FAIL':
-                print(f"\n[{result['section']}] {result['title']}")
-                print(f"  Status: {result['status']}")
-                print(f"  Details: {result['details']}")
-                if result['recommendation']:
-                    print(f"  Recommendation: {result['recommendation']}")
+    # Determine what to show
+    show_passed = args.show_all or args.show_passed
+    show_failed = args.show_all or args.show_failed or args.failed_only or not (args.show_passed or args.show_manual)
+    show_manual = args.show_all or args.show_manual
+    
+    # If failed-only is specified, only show failed
+    if args.failed_only:
+        show_passed = False
+        show_manual = False
+        show_failed = True
+    
+    # Print detailed results
+    scanner.print_detailed_results(
+        show_passed=show_passed,
+        show_failed=show_failed,
+        show_manual=show_manual
+    )
+    
+    # Print quick remediation summary
+    if scanner.failed > 0:
+        print("\n" + "="*70)
+        print("QUICK REMEDIATION SUMMARY")
+        print("="*70 + "\n")
+        
+        failed_results = [r for r in scanner.results if r['status'] == 'FAIL']
+        
+        print("Priority remediation commands:\n")
+        for idx, result in enumerate(failed_results, 1):
+            if result['recommendation']:
+                print(f"{idx}. [{result['section']}] {result['title']}")
+                print(f"   {result['recommendation']}\n")
 
 
 if __name__ == '__main__':
