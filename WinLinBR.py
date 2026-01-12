@@ -636,7 +636,398 @@ class BuildReviewScanner:
                                    stdout,
                                    "Restrict compiler access on production systems")
     
-    def check_scheduled_tasks(self):
+    def check_security_posture(self):
+        """Check security posture from pentest perspective - reconnaissance only"""
+        print("[*] Checking Security Posture (Reconnaissance)...")
+        
+        if self.is_windows:
+            # Check Windows Defender exclusions
+            stdout, _, _ = self.run_command(
+                "Get-MpPreference | Select-Object ExclusionPath,ExclusionExtension,ExclusionProcess",
+                powershell=True
+            )
+            if stdout and len(stdout) > 100:
+                exclusion_count = len([l for l in stdout.split('\n') if l.strip() and ':' in l])
+                if exclusion_count > 5:
+                    self.add_finding("Security Posture", "Multiple AV Exclusions Configured", "MEDIUM",
+                                   f"Found {exclusion_count} antivirus exclusions configured",
+                                   stdout[:1500],
+                                   "Review AV exclusions - excessive exclusions reduce protection and could be abused")
+            
+            # Check PowerShell execution policy
+            stdout, _, _ = self.run_command("Get-ExecutionPolicy -List", powershell=True)
+            if "Unrestricted" in stdout or "Bypass" in stdout:
+                self.add_finding("Security Posture", "Permissive PowerShell Execution Policy", "MEDIUM",
+                               "PowerShell execution policy allows unrestricted script execution",
+                               stdout,
+                               "Set execution policy to RemoteSigned or AllSigned")
+            
+            # Check for PowerShell logging
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging' -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if not stdout or "EnableScriptBlockLogging" not in stdout:
+                self.add_finding("Security Posture", "PowerShell Script Block Logging Disabled", "HIGH",
+                               "PowerShell script block logging is not enabled",
+                               "",
+                               "Enable PowerShell script block logging for visibility into PowerShell activity")
+            
+            # Check PowerShell transcription
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\Transcription' -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if not stdout or "EnableTranscripting" not in stdout:
+                self.add_finding("Security Posture", "PowerShell Transcription Disabled", "MEDIUM",
+                               "PowerShell transcription logging is not enabled",
+                               "",
+                               "Enable PowerShell transcription for complete PowerShell session logging")
+            
+            # Check AMSI providers
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\AMSI\\Providers\\*' -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if stdout:
+                self.add_finding("Security Posture", "AMSI Providers", "INFO",
+                               "AMSI (Antimalware Scan Interface) providers registered", stdout[:500])
+            
+            # Check WMIC availability
+            stdout, _, rc = self.run_command("where wmic", powershell=False)
+            if rc == 0:
+                self.add_finding("Security Posture", "WMIC Available", "INFO",
+                               "WMIC is available (commonly used for reconnaissance and lateral movement)", stdout)
+            
+            # Check Windows Remote Management
+            stdout, _, _ = self.run_command(
+                "Get-Service WinRM | Select-Object Status,StartType",
+                powershell=True
+            )
+            if "Running" in stdout:
+                self.add_finding("Security Posture", "WinRM Service Running", "MEDIUM",
+                               "Windows Remote Management service is running",
+                               stdout,
+                               "If WinRM is not required, disable it. If required, ensure proper authentication and network restrictions")
+            
+            # Check for saved credentials
+            stdout, _, _ = self.run_command("cmdkey /list", powershell=False)
+            if stdout and "Target:" in stdout:
+                cred_count = stdout.count("Target:")
+                self.add_finding("Security Posture", "Saved Credentials Present", "HIGH",
+                               f"Found {cred_count} saved credentials in credential manager",
+                               stdout[:1000],
+                               "Review saved credentials - these can be extracted by attackers with local access")
+            
+            # Check for interesting file shares
+            stdout, _, _ = self.run_command("net share", powershell=False)
+            shares = [l for l in stdout.split('\n') if l.strip() and not l.startswith('-') and 'Share name' not in l]
+            non_default = [s for s in shares if not any(x in s for x in ['C$', 'ADMIN$', 'IPC$', 'print$'])]
+            if non_default:
+                self.add_finding("Security Posture", "Non-Default Shares Present", "MEDIUM",
+                               f"Found {len(non_default)} non-default file shares",
+                               '\n'.join(non_default[:10]),
+                               "Review share permissions and necessity of exposed shares")
+            
+            # Check share permissions
+            stdout, _, _ = self.run_command(
+                "Get-SmbShare | Select-Object Name,Path,Description | Format-Table -AutoSize",
+                powershell=True
+            )
+            self.add_finding("Security Posture", "SMB Share Enumeration", "INFO",
+                           "Current SMB shares configuration", stdout[:1500])
+            
+            # Check LLMNR/NetBIOS
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' -Name EnableMulticast -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if "EnableMulticast" not in stdout or ": 0" not in stdout:
+                self.add_finding("Security Posture", "LLMNR Enabled", "HIGH",
+                               "LLMNR (Link-Local Multicast Name Resolution) is enabled",
+                               "",
+                               "Disable LLMNR to prevent name resolution poisoning attacks (Responder, NTLM relay)")
+            
+            # Check SMB signing
+            stdout, _, _ = self.run_command(
+                "Get-SmbServerConfiguration | Select-Object RequireSecuritySignature,EnableSecuritySignature",
+                powershell=True
+            )
+            if "False" in stdout:
+                self.add_finding("Security Posture", "SMB Signing Not Required", "HIGH",
+                               "SMB signing is not required",
+                               stdout,
+                               "Enable required SMB signing to prevent relay attacks")
+            
+            # Check WPAD
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' -Name AutoDetect -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if "AutoDetect" in stdout and ": 1" in stdout:
+                self.add_finding("Security Posture", "WPAD Enabled", "MEDIUM",
+                               "Web Proxy Auto-Discovery (WPAD) is enabled",
+                               stdout,
+                               "Disable WPAD to prevent WPAD spoofing attacks")
+            
+            # Check for AutoAdminLogon
+            stdout, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon' -Name AutoAdminLogon -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if "AutoAdminLogon" in stdout and ": 1" in stdout:
+                self.add_finding("Security Posture", "Auto Admin Logon Enabled", "CRITICAL",
+                               "Automatic administrator login is enabled",
+                               stdout,
+                               "Disable AutoAdminLogon - credentials may be stored in clear text in registry")
+            
+            # Check for AlwaysInstallElevated
+            stdout1, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer' -Name AlwaysInstallElevated -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            stdout2, _, _ = self.run_command(
+                "Get-ItemProperty -Path 'HKCU:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer' -Name AlwaysInstallElevated -ErrorAction SilentlyContinue",
+                powershell=True
+            )
+            if "AlwaysInstallElevated" in stdout1 and "AlwaysInstallElevated" in stdout2:
+                self.add_finding("Security Posture", "AlwaysInstallElevated Enabled", "CRITICAL",
+                               "AlwaysInstallElevated is enabled in both HKLM and HKCU",
+                               f"HKLM: {stdout1}\nHKCU: {stdout2}",
+                               "Disable AlwaysInstallElevated - allows privilege escalation via MSI installers")
+            
+            # Check AppLocker policies
+            stdout, _, _ = self.run_command(
+                "Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RuleCollections",
+                powershell=True
+            )
+            if not stdout or len(stdout) < 50:
+                self.add_finding("Security Posture", "No AppLocker Policies", "MEDIUM",
+                               "AppLocker application control policies are not configured",
+                               "",
+                               "Consider implementing AppLocker to control which applications can run")
+            else:
+                self.add_finding("Security Posture", "AppLocker Enabled", "INFO",
+                               "AppLocker application control is configured", stdout[:1000])
+            
+            # Check for unquoted service paths
+            stdout, _, _ = self.run_command(
+                "Get-WmiObject -Class Win32_Service | Where-Object {$_.PathName -notmatch '^\".+\"' -and $_.PathName -match '.+\\s.+' -and $_.StartMode -ne 'Disabled'} | Select-Object Name,PathName,StartMode | Format-List",
+                powershell=True
+            )
+            if stdout and "PathName" in stdout:
+                self.add_finding("Security Posture", "Unquoted Service Paths", "HIGH",
+                               "Found services with unquoted paths containing spaces",
+                               stdout[:2000],
+                               "Quote service paths to prevent privilege escalation via path hijacking")
+            
+            # Check running processes for interesting targets
+            stdout, _, _ = self.run_command(
+                "Get-Process | Where-Object {$_.ProcessName -match 'lsass|winlogon|csrss'} | Select-Object ProcessName,Id | Format-Table",
+                powershell=True
+            )
+            if stdout:
+                self.add_finding("Security Posture", "Sensitive Processes Running", "INFO",
+                               "Sensitive system processes (potential credential dump targets)", stdout)
+        
+        elif self.is_linux:
+            # Check for writable system paths in PATH
+            stdout, _, _ = self.run_command("echo $PATH")
+            if stdout:
+                paths = stdout.split(':')
+                writable_paths = []
+                for path in paths:
+                    check_stdout, _, rc = self.run_command(f"test -w {path} && echo 'writable' 2>/dev/null")
+                    if rc == 0 and 'writable' in check_stdout:
+                        writable_paths.append(path)
+                
+                if writable_paths:
+                    self.add_finding("Security Posture", "Writable Paths in $PATH", "HIGH",
+                                   f"Found {len(writable_paths)} writable directories in PATH",
+                                   '\n'.join(writable_paths),
+                                   "Remove write permissions from system PATH directories to prevent binary hijacking")
+            
+            # Check for SUID/SGID binaries
+            stdout, _, _ = self.run_command(
+                "find / -type f \\( -perm -4000 -o -perm -2000 \\) -ls 2>/dev/null | head -50"
+            )
+            suid_count = len([l for l in stdout.split('\n') if l.strip()])
+            if suid_count > 0:
+                self.add_finding("Security Posture", "SUID/SGID Binaries", "MEDIUM",
+                               f"Found {suid_count} SUID/SGID binaries (potential privilege escalation vectors)",
+                               stdout[:2000],
+                               "Review SUID/SGID binaries and remove unnecessary privileges")
+            
+            # Check for world-writable files in system directories
+            stdout, _, _ = self.run_command(
+                "find /etc /usr /bin /sbin -type f -perm -002 2>/dev/null | head -20"
+            )
+            if stdout:
+                self.add_finding("Security Posture", "World-Writable System Files", "CRITICAL",
+                               "Found world-writable files in system directories",
+                               stdout,
+                               "Remove world-write permissions from system files immediately")
+            
+            # Check for world-writable directories
+            stdout, _, _ = self.run_command(
+                "find / -type d -perm -002 ! -path '/proc/*' ! -path '/sys/*' ! -path '/tmp/*' ! -path '/var/tmp/*' 2>/dev/null | head -20"
+            )
+            if stdout:
+                writable_dirs = [d for d in stdout.split('\n') if d.strip()]
+                if writable_dirs:
+                    self.add_finding("Security Posture", "World-Writable Directories", "MEDIUM",
+                                   f"Found {len(writable_dirs)} world-writable directories outside standard temp locations",
+                                   '\n'.join(writable_dirs[:10]),
+                                   "Review and restrict permissions on world-writable directories")
+            
+            # Check for files with no owner
+            stdout, _, _ = self.run_command(
+                "find / -nouser -o -nogroup 2>/dev/null | head -20"
+            )
+            if stdout:
+                self.add_finding("Security Posture", "Files Without Owner", "LOW",
+                               "Found files without valid user/group ownership",
+                               stdout,
+                               "Assign proper ownership or remove orphaned files")
+            
+            # Check sudo configuration
+            stdout, _, rc = self.run_command("sudo -l 2>/dev/null")
+            if rc == 0 and stdout:
+                if "NOPASSWD" in stdout:
+                    self.add_finding("Security Posture", "Passwordless Sudo Configured", "HIGH",
+                                   "User can run commands with sudo without password",
+                                   stdout[:1000],
+                                   "Review sudo configuration - passwordless sudo increases privilege escalation risk")
+                elif "(ALL)" in stdout or "(ALL : ALL)" in stdout:
+                    self.add_finding("Security Posture", "Broad Sudo Privileges", "MEDIUM",
+                                   "User has broad sudo privileges",
+                                   stdout[:1000],
+                                   "Restrict sudo access to only required commands")
+            
+            # Check sudoers file for dangerous configs
+            if os.path.exists("/etc/sudoers"):
+                try:
+                    stdout, _, _ = self.run_command("cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep -v '^#' | grep -v '^$'")
+                    if "!authenticate" in stdout or "NOPASSWD" in stdout:
+                        self.add_finding("Security Posture", "Risky Sudoers Configuration", "HIGH",
+                                       "Sudoers file contains passwordless or unauthenticated entries",
+                                       stdout[:1500],
+                                       "Review and restrict sudoers configuration")
+                except:
+                    pass
+            
+            # Check for readable sensitive files
+            sensitive_files = [
+                '/etc/shadow',
+                '/etc/gshadow',
+                '/root/.ssh/id_rsa',
+                '/root/.ssh/id_dsa',
+                '/root/.bash_history',
+                '/home/*/.ssh/id_rsa',
+                '/home/*/.bash_history'
+            ]
+            
+            readable_sensitive = []
+            for filepath in sensitive_files:
+                stdout, _, rc = self.run_command(f"test -r {filepath} && echo 'readable' 2>/dev/null")
+                if rc == 0 and 'readable' in stdout:
+                    readable_sensitive.append(filepath)
+            
+            if readable_sensitive:
+                self.add_finding("Security Posture", "Readable Sensitive Files", "CRITICAL",
+                               f"Found {len(readable_sensitive)} sensitive files readable by current user",
+                               '\n'.join(readable_sensitive[:10]),
+                               "Restrict permissions on sensitive files")
+            
+            # Check for SSH keys
+            stdout, _, _ = self.run_command("find /home /root -name 'id_rsa' -o -name 'id_dsa' -o -name 'id_ecdsa' -o -name 'id_ed25519' 2>/dev/null")
+            if stdout:
+                key_count = len([k for k in stdout.split('\n') if k.strip()])
+                self.add_finding("Security Posture", "SSH Private Keys Found", "INFO",
+                               f"Found {key_count} SSH private keys on system",
+                               stdout[:1000],
+                               "Ensure SSH keys are properly protected and not world-readable")
+            
+            # Check for credentials in environment variables
+            stdout, _, _ = self.run_command("env | grep -i 'pass\\|pwd\\|secret\\|key\\|token' | head -10")
+            if stdout:
+                self.add_finding("Security Posture", "Potential Credentials in Environment", "MEDIUM",
+                               "Found environment variables that may contain credentials",
+                               stdout,
+                               "Avoid storing credentials in environment variables")
+            
+            # Check for interesting capabilities
+            stdout, _, _ = self.run_command("getcap -r / 2>/dev/null | head -20")
+            if stdout:
+                self.add_finding("Security Posture", "Files with Capabilities", "MEDIUM",
+                               "Found files with Linux capabilities set",
+                               stdout,
+                               "Review files with capabilities - some can be abused for privilege escalation")
+            
+            # Check for Docker socket access
+            stdout, _, rc = self.run_command("test -w /var/run/docker.sock && echo 'writable' 2>/dev/null")
+            if rc == 0 and 'writable' in stdout:
+                self.add_finding("Security Posture", "Docker Socket Writable", "CRITICAL",
+                               "Current user has write access to Docker socket",
+                               "/var/run/docker.sock is writable",
+                               "Docker socket access provides root-equivalent privileges")
+            
+            # Check for interesting groups
+            stdout, _, _ = self.run_command("id")
+            if stdout:
+                risky_groups = ['docker', 'lxd', 'disk', 'video', 'sudo', 'wheel', 'adm']
+                user_groups = stdout.lower()
+                found_risky = [g for g in risky_groups if g in user_groups]
+                
+                if found_risky:
+                    self.add_finding("Security Posture", "User in Privileged Groups", "HIGH",
+                                   f"User is member of privileged groups: {', '.join(found_risky)}",
+                                   stdout,
+                                   "Membership in these groups may provide privilege escalation paths")
+            
+            # Check for NFS exports
+            if os.path.exists("/etc/exports"):
+                stdout, _, _ = self.run_command("cat /etc/exports | grep -v '^#' | grep -v '^$'")
+                if stdout:
+                    if "no_root_squash" in stdout:
+                        self.add_finding("Security Posture", "NFS no_root_squash Configured", "CRITICAL",
+                                       "NFS exports configured with no_root_squash",
+                                       stdout,
+                                       "Remove no_root_squash from NFS exports - allows root access from clients")
+                    else:
+                        self.add_finding("Security Posture", "NFS Exports Configured", "MEDIUM",
+                                       "NFS exports are configured",
+                                       stdout[:1000],
+                                       "Review NFS export permissions and client restrictions")
+            
+            # Check for kernel modules that can be loaded
+            stdout, _, _ = self.run_command("lsmod | head -20")
+            self.add_finding("Security Posture", "Loaded Kernel Modules", "INFO",
+                           "Currently loaded kernel modules", stdout)
+            
+            # Check for core dumps enabled
+            stdout, _, _ = self.run_command("ulimit -c")
+            if stdout and stdout.strip() != "0":
+                self.add_finding("Security Posture", "Core Dumps Enabled", "MEDIUM",
+                               f"Core dumps are enabled (limit: {stdout})",
+                               stdout,
+                               "Disable core dumps to prevent information disclosure")
+            
+            # Check for .rhosts or .netrc files
+            stdout, _, _ = self.run_command("find /home /root -name '.rhosts' -o -name '.netrc' 2>/dev/null")
+            if stdout:
+                self.add_finding("Security Posture", "Legacy Authentication Files Found", "HIGH",
+                               "Found .rhosts or .netrc files (legacy insecure authentication)",
+                               stdout,
+                               "Remove .rhosts and .netrc files - these use insecure authentication")
+            
+            # Check tmux/screen sessions
+            stdout, _, _ = self.run_command("ls /tmp/tmux-* /var/run/screen 2>/dev/null")
+            if stdout:
+                self.add_finding("Security Posture", "Tmux/Screen Sessions Detected", "LOW",
+                               "Active tmux or screen sessions detected",
+                               stdout,
+                               "Other users' tmux/screen sessions may contain sensitive information")
         """Check scheduled tasks and cron jobs"""
         print("[*] Checking Scheduled Tasks...")
         
@@ -695,6 +1086,7 @@ class BuildReviewScanner:
         self.check_installed_software()
         self.check_audit_logging()
         self.check_system_hardening()
+        self.check_security_posture()
         self.check_scheduled_tasks()
     
     def generate_report(self, output_file=None):
