@@ -1028,6 +1028,50 @@ class BuildReviewScanner:
                                "Active tmux or screen sessions detected",
                                stdout,
                                "Other users' tmux/screen sessions may contain sensitive information")
+    
+    def check_scheduled_tasks(self):
+        """Check scheduled tasks and cron jobs"""
+        print("[*] Checking Scheduled Tasks...")
+        
+        if self.is_windows:
+            # Get scheduled tasks
+            stdout, _, _ = self.run_command(
+                "Get-ScheduledTask | Where-Object {$_.State -ne 'Disabled'} | Select-Object TaskName,TaskPath,State | Format-Table -AutoSize",
+                powershell=True
+            )
+            
+            task_count = len([l for l in stdout.split('\n') if l.strip() and 'TaskName' not in l and '---' not in l])
+            self.add_finding("Scheduled Tasks", "Active Scheduled Tasks", "INFO",
+                           f"Found {task_count} active scheduled tasks", stdout[:3000])
+            
+            # Check for suspicious task paths
+            stdout, _, _ = self.run_command(
+                "Get-ScheduledTask | Where-Object {$_.TaskPath -notlike '\\Microsoft\\*' -and $_.State -ne 'Disabled'} | Select-Object TaskName,TaskPath,Actions | Format-List",
+                powershell=True
+            )
+            if stdout and len(stdout) > 100:
+                self.add_finding("Scheduled Tasks", "Non-Microsoft Scheduled Tasks", "MEDIUM",
+                               "Found active scheduled tasks not in Microsoft paths - review required",
+                               stdout[:2000],
+                               "Review non-Microsoft scheduled tasks for legitimacy")
+        
+        elif self.is_linux:
+            # Check crontabs
+            stdout, _, _ = self.run_command("crontab -l 2>/dev/null")
+            if stdout and not "no crontab" in stdout.lower():
+                self.add_finding("Scheduled Tasks", "Root Crontab", "INFO",
+                               "Root user has crontab entries", stdout[:1000])
+            
+            # Check system-wide cron
+            stdout, _, _ = self.run_command("ls -la /etc/cron.*/* 2>/dev/null | head -50")
+            self.add_finding("Scheduled Tasks", "System Cron Jobs", "INFO",
+                           "System-wide cron jobs", stdout[:2000])
+            
+            # Check at jobs
+            stdout, _, _ = self.run_command("atq")
+            if stdout:
+                self.add_finding("Scheduled Tasks", "Pending at Jobs", "INFO",
+                               "Pending at jobs", stdout)
         """Check scheduled tasks and cron jobs"""
         print("[*] Checking Scheduled Tasks...")
         
