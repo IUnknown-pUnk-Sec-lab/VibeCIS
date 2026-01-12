@@ -175,12 +175,22 @@ class BuildReviewScanner:
             # Check password aging
             stdout, _, _ = self.run_command("grep '^PASS_MAX_DAYS' /etc/login.defs")
             if stdout:
-                days = stdout.split()[-1]
-                if int(days) > 90:
-                    self.add_finding("User Accounts", "Password Expiration Too Long", "MEDIUM",
-                                   f"Password expiration set to {days} days (recommended: 90 or less)",
-                                   stdout,
-                                   "Set PASS_MAX_DAYS to 90 or less in /etc/login.defs")
+                parts = stdout.split()
+                if len(parts) >= 2:
+                    days = parts[-1]
+                    try:
+                        days_int = int(days)
+                        if days_int > 90:
+                            self.add_finding("User Accounts", "Password Expiration Too Long", "MEDIUM",
+                                           f"Password expiration set to {days} days (recommended: 90 or less)",
+                                           stdout,
+                                           "Set PASS_MAX_DAYS to 90 or less in /etc/login.defs")
+                        else:
+                            self.add_finding("User Accounts", "Password Expiration Policy", "INFO",
+                                           f"Password expiration is set to {days} days", stdout)
+                    except ValueError:
+                        self.add_finding("User Accounts", "Password Expiration Policy", "INFO",
+                                       f"Password expiration setting: {days}", stdout)
             
             # Check for users with login shells
             stdout, _, _ = self.run_command("awk -F: '($3 >= 1000 && $7 !~ /nologin|false/) {print $1}' /etc/passwd")
@@ -247,53 +257,91 @@ class BuildReviewScanner:
                                "Review RDP necessity, enable NLA, and restrict access via firewall")
         
         elif self.is_linux:
-            # Check listening ports
+            # Check listening ports - only flag if actually found
             stdout, _, rc = self.run_command("ss -tlnp")
             if rc != 0:
                 stdout, _, _ = self.run_command("netstat -tlnp")
             
-            risky_ports = []
-            for line in stdout.split('\n'):
-                if any(port in line for port in [':21', ':23', ':69', ':111', ':135', ':139', ':445', ':512', ':513', ':514']):
-                    risky_ports.append(line.strip())
+            # Only report risky ports if we have valid output
+            if stdout and rc == 0:
+                risky_ports = []
+                for line in stdout.split('\n'):
+                    # Check for specific risky ports
+                    if ':21 ' in line or ':21\t' in line:  # FTP
+                        risky_ports.append(f"FTP (21): {line.strip()}")
+                    elif ':23 ' in line or ':23\t' in line:  # Telnet
+                        risky_ports.append(f"Telnet (23): {line.strip()}")
+                    elif ':69 ' in line or ':69\t' in line:  # TFTP
+                        risky_ports.append(f"TFTP (69): {line.strip()}")
+                    elif ':111 ' in line or ':111\t' in line:  # RPC
+                        risky_ports.append(f"RPC (111): {line.strip()}")
+                    elif ':512 ' in line or ':512\t' in line:  # rexec
+                        risky_ports.append(f"rexec (512): {line.strip()}")
+                    elif ':513 ' in line or ':513\t' in line:  # rlogin
+                        risky_ports.append(f"rlogin (513): {line.strip()}")
+                    elif ':514 ' in line or ':514\t' in line:  # rsh
+                        risky_ports.append(f"rsh (514): {line.strip()}")
+                
+                if risky_ports:
+                    self.add_finding("Network Services", "Potentially Risky Open Ports", "HIGH",
+                                   f"Found {len(risky_ports)} potentially risky ports listening",
+                                   '\n'.join(risky_ports),
+                                   "Review necessity of these services and restrict access")
+                
+                self.add_finding("Network Services", "Listening TCP Ports", "INFO",
+                               "All listening TCP ports", stdout[:2000])
             
-            if risky_ports:
-                self.add_finding("Network Services", "Potentially Risky Open Ports", "HIGH",
-                               "Found potentially risky ports open",
-                               '\n'.join(risky_ports),
-                               "Review necessity of these services and restrict access")
-            
-            self.add_finding("Network Services", "Listening TCP Ports", "INFO",
-                           "All listening TCP ports", stdout[:2000])
-            
-            # Check for unnecessary services
-            dangerous_services = ['telnet', 'rsh', 'rlogin', 'vsftpd', 'xinetd']
+            # Check for unnecessary services - only report if actually running
+            dangerous_services = ['telnet', 'rsh', 'rlogin', 'vsftpd', 'xinetd', 'rsh-server', 'rlogin-server', 'telnet-server']
             for service in dangerous_services:
-                stdout, _, rc = self.run_command(f"systemctl is-active {service}")
-                if "active" in stdout:
-                    self.add_finding("Network Services", f"Insecure Service Running: {service}", "HIGH",
-                                   f"Insecure service {service} is running",
-                                   stdout,
-                                   f"Stop and disable {service}: systemctl stop {service} && systemctl disable {service}")
+                # First check if service unit exists
+                check_stdout, _, check_rc = self.run_command(f"systemctl list-unit-files {service}.service 2>/dev/null")
+                
+                # Only proceed if service unit exists
+                if check_rc == 0 and service in check_stdout:
+                    stdout, _, rc = self.run_command(f"systemctl is-active {service}")
+                    if rc == 0 and "active" in stdout:
+                        self.add_finding("Network Services", f"Insecure Service Running: {service}", "HIGH",
+                                       f"Insecure service {service} is running",
+                                       stdout,
+                                       f"Stop and disable {service}: systemctl stop {service} && systemctl disable {service}")
             
             # Check SSH configuration
             if os.path.exists("/etc/ssh/sshd_config"):
-                with open("/etc/ssh/sshd_config", 'r') as f:
-                    ssh_config = f.read()
-                
-                issues = []
-                if "PermitRootLogin yes" in ssh_config:
-                    issues.append("Root login via SSH is permitted")
-                if "PasswordAuthentication yes" in ssh_config and "PubkeyAuthentication no" in ssh_config:
-                    issues.append("Only password authentication enabled (no pubkey)")
-                if "PermitEmptyPasswords yes" in ssh_config:
-                    issues.append("Empty passwords are permitted")
-                
-                if issues:
-                    self.add_finding("Network Services", "SSH Configuration Issues", "HIGH",
-                                   '\n'.join(issues),
-                                   ssh_config[:1000],
-                                   "Harden SSH configuration: disable root login, use key-based auth, disable empty passwords")
+                try:
+                    with open("/etc/ssh/sshd_config", 'r') as f:
+                        ssh_config = f.read()
+                    
+                    issues = []
+                    
+                    # Check for explicitly enabled bad settings (not commented out)
+                    config_lines = [line.strip() for line in ssh_config.split('\n') 
+                                   if line.strip() and not line.strip().startswith('#')]
+                    
+                    for line in config_lines:
+                        if line.startswith('PermitRootLogin') and 'yes' in line.lower():
+                            issues.append("Root login via SSH is explicitly permitted")
+                        elif line.startswith('PermitEmptyPasswords') and 'yes' in line.lower():
+                            issues.append("Empty passwords are explicitly permitted")
+                    
+                    # Check if password auth is the only method
+                    has_pubkey = any('PubkeyAuthentication yes' in line for line in config_lines)
+                    has_password = any('PasswordAuthentication yes' in line for line in config_lines)
+                    
+                    if has_password and not has_pubkey:
+                        issues.append("Only password authentication enabled (pubkey auth not found)")
+                    
+                    if issues:
+                        self.add_finding("Network Services", "SSH Configuration Issues", "HIGH",
+                                       '\n'.join(issues),
+                                       '\n'.join(issues),
+                                       "Harden SSH configuration: disable root login, use key-based auth, disable empty passwords")
+                    else:
+                        self.add_finding("Network Services", "SSH Configuration", "INFO",
+                                       "SSH configuration appears properly hardened", "")
+                except Exception as e:
+                    self.add_finding("Network Services", "SSH Configuration Check Failed", "LOW",
+                                   f"Could not read SSH configuration: {str(e)}", "", "")
     
     def check_security_software(self):
         """Check antivirus and security software"""
@@ -559,20 +607,24 @@ class BuildReviewScanner:
             }
             
             issues = []
+            checked_params = []
+            
             for param, expected in hardening_params.items():
-                stdout, _, rc = self.run_command(f"sysctl {param}")
-                if rc == 0:
-                    if f"{param} = {expected}" not in stdout:
-                        issues.append(f"{param} is not set to {expected}")
+                stdout, _, rc = self.run_command(f"sysctl {param} 2>/dev/null")
+                if rc == 0 and stdout:
+                    checked_params.append(param)
+                    actual_value = stdout.split('=')[-1].strip() if '=' in stdout else ""
+                    if actual_value != expected:
+                        issues.append(f"{param} = {actual_value} (expected: {expected})")
             
             if issues:
                 self.add_finding("System Hardening", "Kernel Parameters Not Hardened", "MEDIUM",
                                f"Found {len(issues)} kernel parameters not set to secure values",
-                               '\n'.join(issues),
-                               "Configure secure kernel parameters in /etc/sysctl.conf")
-            else:
+                               '\n'.join(issues[:10]),  # Limit output
+                               "Configure secure kernel parameters in /etc/sysctl.conf or /etc/sysctl.d/")
+            elif checked_params:
                 self.add_finding("System Hardening", "Kernel Hardening", "INFO",
-                               "Key kernel hardening parameters are properly configured", "")
+                               f"Checked {len(checked_params)} kernel hardening parameters - all properly configured", "")
             
             # Check for compiler restrictions
             stdout, _, _ = self.run_command("ls -la /usr/bin/gcc /usr/bin/cc 2>/dev/null")
